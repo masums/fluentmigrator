@@ -1,7 +1,7 @@
 #region License
-// 
-// Copyright (c) 2007-2009, Sean Chambers <schambers80@gmail.com>
-// 
+//
+// Copyright (c) 2007-2018, Sean Chambers <schambers80@gmail.com>
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,38 +20,76 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
+using FluentMigrator.Infrastructure;
+using FluentMigrator.Infrastructure.Extensions;
+using FluentMigrator.Runner.Initialization;
+
+using JetBrains.Annotations;
+
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+
 namespace FluentMigrator.Runner
 {
     public class MaintenanceLoader : IMaintenanceLoader
     {
-        private readonly IMigrationRunner _runner;
         private readonly IDictionary<MigrationStage, IList<IMigration>> _maintenance;
 
-        public MaintenanceLoader(IMigrationRunner runner, IMigrationConventions conventions)
+        [Obsolete]
+        public MaintenanceLoader(IAssemblyCollection assemblyCollection, IEnumerable<string> tags, IMigrationRunnerConventions conventions)
         {
-            _runner = runner;
+            var tagsList = tags?.ToArray() ?? new string[0];
+
             _maintenance = (
-                from type in runner.MigrationAssembly.GetExportedTypes()
-                let stage = conventions.GetMaintenanceStage(type)
-                where stage != null
+                from a in assemblyCollection.Assemblies
+                    from type in a.GetExportedTypes()
+                    let stage = conventions.GetMaintenanceStage(type)
+                    where stage != null
+                where conventions.HasRequestedTags(type, tagsList, false)
                 let migration = (IMigration)Activator.CreateInstance(type)
-                group migration by stage
+                group migration by stage.GetValueOrDefault()
             ).ToDictionary(
-                g => g.Key.Value,
+                g => g.Key,
                 g => (IList<IMigration>)g.OrderBy(m => m.GetType().Name).ToArray()
             );
         }
-        
-        public void ApplyMaintenance(MigrationStage stage)
+
+        public MaintenanceLoader(
+            [NotNull] IAssemblySource assemblySource,
+            [NotNull] IOptions<RunnerOptions> options,
+            [NotNull] IMigrationRunnerConventions conventions,
+            [NotNull] IServiceProvider serviceProvider)
         {
-            IList<IMigration> migrations;
-            if (!_maintenance.TryGetValue(stage, out migrations))
-                return;
+            var tagsList = options.Value.Tags ?? new string[0];
+
+            var types = assemblySource.Assemblies.SelectMany(a => a.ExportedTypes).ToList();
+
+            _maintenance = (
+                from type in types
+                let stage = conventions.GetMaintenanceStage(type)
+                where stage != null
+                where conventions.HasRequestedTags(type, tagsList, options.Value.IncludeUntaggedMaintenances)
+                let migration = (IMigration) ActivatorUtilities.CreateInstance(serviceProvider, type)
+                group migration by stage.GetValueOrDefault()
+            ).ToDictionary(
+                g => g.Key,
+                g => (IList<IMigration>)g.OrderBy(m => m.GetType().Name).ToArray()
+            );
+        }
+
+        public IList<IMigrationInfo> LoadMaintenance(MigrationStage stage)
+        {
+            IList<IMigrationInfo> migrationInfos = new List<IMigrationInfo>();
+            if (!_maintenance.TryGetValue(stage, out var migrations))
+                return migrationInfos;
 
             foreach (var migration in migrations)
             {
-                _runner.Up(migration);
+                var transactionBehavior = migration.GetType().GetOneAttribute<MaintenanceAttribute>().TransactionBehavior;
+                migrationInfos.Add(new NonAttributedMigrationToMigrationInfoAdapter(migration, transactionBehavior));
             }
+
+            return migrationInfos;
         }
     }
 }
